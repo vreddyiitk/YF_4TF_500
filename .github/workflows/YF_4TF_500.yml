@@ -1,0 +1,54 @@
+name: Midcap Stock Charts
+
+on:
+  schedule:
+    - cron: '30 10 * * 1-5'   # 4:00 PM IST, Mon–Fri
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  generate-charts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5.4.0
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install yfinance pandas openpyxl matplotlib
+
+      - name: Run chart generator
+        run: python chart_generator.py
+
+      - name: Check charts output
+        run: |
+          echo "=== Current directory ==="
+          ls -la
+          echo "=== Charts folder ==="
+          ls -la YF_D_MC/ || echo "YF_D_MC/ folder does not exist!"
+
+      - name: Zip charts folder
+        run: |
+          if [ -d "YF_D_MC" ] && [ "$(ls -A YF_D_MC)" ]; then
+            zip -r charts_$(date +%Y-%m-%d).zip YF_D_MC/
+            echo "Zip created successfully"
+          else
+            echo "ERROR: YF_D_MC folder is empty or missing"
+            ls -la
+            exit 1
+          fi
+
+      - name: Create GitHub Release with charts
+        uses: softprops/action-gh-release@v2.2.1
+        with:
+          tag_name: charts-${{ github.run_number }}
+          name: "Midcap Charts – ${{ github.run_number }}"
+          files: charts_*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
