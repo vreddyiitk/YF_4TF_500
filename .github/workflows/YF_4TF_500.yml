@@ -21,7 +21,7 @@ jobs:
         run: pip install yfinance pandas openpyxl matplotlib
 
       - name: Run chart generator
-        run: python YF_4TF_500.py
+        run: python YF_4TF_500_Final.py
 
       - name: Check charts output
         run: |
