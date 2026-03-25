@@ -1,13 +1,10 @@
-name: Midcap Stock Charts
-
+name: Nifty 500 Stock Charts
 on:
   schedule:
-    - cron: '30 10 * * 1-5'   # 4:00 PM IST, Mon–Fri
+    - cron: '0 10 * * 1-5'   # 21:30 UTC = 4:00 PM ET (after NYSE close)
   workflow_dispatch:
-
 permissions:
   contents: write
-
 jobs:
   generate-charts:
     runs-on: ubuntu-latest
@@ -24,22 +21,27 @@ jobs:
         run: pip install yfinance pandas openpyxl matplotlib
 
       - name: Run chart generator
-        run: python chart_generator.py
+        run: python YF_4TF_500.py
 
       - name: Check charts output
         run: |
           echo "=== Current directory ==="
           ls -la
           echo "=== Charts folder ==="
-          ls -la YF_D_MC/ || echo "YF_D_MC/ folder does not exist!"
+          ls -la YF_4TF_500/ || echo "YF_4TF_500/ folder does not exist!"
 
       - name: Zip charts folder
         run: |
-          if [ -d "YF_D_MC" ] && [ "$(ls -A YF_D_MC)" ]; then
-            zip -r charts_$(date +%Y-%m-%d).zip YF_D_MC/
-            echo "Zip created successfully"
+          if [ -d "YF_4TF_500" ] && [ "$(ls -A YF_4TF_500)" ]; then
+            cd YF_4TF_500
+            ZIP_NAME="charts_NSE500_$(date +'%Y-%m-%d').zip"
+            zip -j "../${ZIP_NAME}" *.png
+            cd ..
+            echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+            echo "Created: ${ZIP_NAME}"
+            ls -lh "${ZIP_NAME}"
           else
-            echo "ERROR: YF_D_MC folder is empty or missing"
+            echo "ERROR: YF_4TF_500 folder is empty or missing"
             ls -la
             exit 1
           fi
@@ -47,8 +49,8 @@ jobs:
       - name: Create GitHub Release with charts
         uses: softprops/action-gh-release@v2.2.1
         with:
-          tag_name: charts-${{ github.run_number }}
-          name: "Midcap Charts – ${{ github.run_number }}"
-          files: charts_*.zip
+          tag_name: charts-NSE500-${{ github.run_number }}
+          name: "NSE 500 - ${{ github.run_number }}"
+          files: ${{ env.ZIP_NAME }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
