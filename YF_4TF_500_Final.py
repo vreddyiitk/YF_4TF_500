@@ -194,8 +194,16 @@ def fetch_ohlc(ticker, interval):
             df = df.between_time("09:15", "15:30")
             df.index = df.index.tz_localize(None)
 
-        # Need at least enough bars for MACD to be meaningful
-        min_bars = MACD_SLOW + MACD_SIGNAL + 2
+        # Plot whatever is available — even a single bar is useful.
+        # For monthly we accept any number of bars (min=1).
+        # For other intervals keep a small floor for MACD warm-up.
+        if interval == "1mo":
+            min_bars = 1
+        elif interval == "1h":
+            min_bars = MACD_SLOW + MACD_SIGNAL + 2
+        else:
+            min_bars = MACD_SLOW + MACD_SIGNAL + 2
+
         if len(df) < min_bars:
             return None
 
@@ -215,13 +223,21 @@ def draw_quarter(ax_price, ax_macd, df, label, colors, date_fmt, y_side="right")
     """
     Draw candlestick + EMA9 on ax_price and MACD on ax_macd.
     y_side : "left" for left column, "right" for right column
+    Handles any number of bars ≥ 1 gracefully.
     """
     s   = STYLE
     n   = len(df)
     xs  = np.arange(n)
 
-    ema9              = ema(df["Close"], EMA_PERIOD)
-    macd_l, sig, hist = macd_calc(df["Close"], MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    # EMA — ewm works with any number of bars (warm-up handled internally)
+    ema9 = ema(df["Close"], EMA_PERIOD)
+
+    # MACD — only compute if we have enough bars; otherwise set to None
+    has_macd = n >= MACD_SLOW + MACD_SIGNAL + 2
+    if has_macd:
+        macd_l, sig, hist = macd_calc(df["Close"], MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    else:
+        macd_l = sig = hist = None
 
     # ── style both axes ───────────────────────────────────────────────────────
     for ax in (ax_price, ax_macd):
@@ -306,16 +322,27 @@ def draw_quarter(ax_price, ax_macd, df, label, colors, date_fmt, y_side="right")
                                  alpha=0.95))
 
     # ── MACD ──────────────────────────────────────────────────────────────────
-    hcols = [colors["hu"] if v >= 0 else colors["hd"] for v in hist.values]
-    ax_macd.bar(xs, hist.values, color=hcols, alpha=0.80, width=0.65, zorder=2)
-    ax_macd.plot(xs, macd_l.values, color=colors["macd"], linewidth=1.0,
-                 zorder=3, label="MACD")
-    ax_macd.plot(xs, sig.values,    color=colors["sig"],  linewidth=0.9,
-                 zorder=3, label="Signal")
-    ax_macd.axhline(0, color=s["zero_line"], linewidth=0.6, linestyle="--")
-    ax_macd.legend(loc="upper left", fontsize=6.5, framealpha=0.6,
-                   facecolor=s["bg"], edgecolor=s["border"],
-                   labelcolor=s["text"])
+    if has_macd:
+        hcols = [colors["hu"] if v >= 0 else colors["hd"] for v in hist.values]
+        ax_macd.bar(xs, hist.values, color=hcols, alpha=0.80, width=0.65, zorder=2)
+        ax_macd.plot(xs, macd_l.values, color=colors["macd"], linewidth=1.0,
+                     zorder=3, label="MACD")
+        ax_macd.plot(xs, sig.values,    color=colors["sig"],  linewidth=0.9,
+                     zorder=3, label="Signal")
+        ax_macd.axhline(0, color=s["zero_line"], linewidth=0.6, linestyle="--")
+        ax_macd.legend(loc="upper left", fontsize=6.5, framealpha=0.6,
+                       facecolor=s["bg"], edgecolor=s["border"],
+                       labelcolor=s["text"])
+    else:
+        # Not enough bars for MACD — show a note
+        ax_macd.set_facecolor(s["panel_bg"])
+        ax_macd.set_xticks([])
+        ax_macd.set_yticks([])
+        ax_macd.text(0.5, 0.5,
+                     f"MACD needs ≥{MACD_SLOW + MACD_SIGNAL + 2} bars  (have {n})",
+                     transform=ax_macd.transAxes,
+                     color=s["subtext"], fontsize=7, ha="center", va="center",
+                     style="italic")
 
     # ── x-axis labels ─────────────────────────────────────────────────────────
     step = max(n // 8, 1)
@@ -395,13 +422,33 @@ def plot_chart(symbol, d_df, w_df, m_df, h_df, output_path):
 
     # ── helper: show "No data" placeholder ───────────────────────────────────
     def no_data(ax_p, ax_m, label):
+        colors = tf_colors.get(
+            {"Daily":"d","Weekly":"w","Monthly":"mo","Hourly":"h"}.get(label, "d"))
         for ax in (ax_p, ax_m):
             ax.set_facecolor(s["panel_bg"])
             for spine in ax.spines.values():
                 spine.set_edgecolor(s["border"])
-        ax_p.text(0.5, 0.5, f"{label}\nNo data",
+            # Hide all tick labels and ticks — prevents 0.0/0.2/0.4 showing
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.tick_params(left=False, right=False,
+                           bottom=False, labelbottom=False,
+                           labelleft=False, labelright=False)
+        # Timeframe label badge (same style as normal quarters)
+        ax_p.set_title(f"  {label}  ",
+                       loc="left", color=s["bg"],
+                       fontsize=10, fontweight="bold", pad=3,
+                       bbox=dict(boxstyle="round,pad=0.35",
+                                 facecolor=colors["ema"] if colors else s["subtext"],
+                                 edgecolor="none", alpha=0.95))
+        ax_p.text(0.5, 0.5,
+                  f"No monthly data\n(recently listed stock)",
                   transform=ax_p.transAxes,
-                  color=s["subtext"], fontsize=12,
+                  color=s["subtext"], fontsize=10,
+                  ha="center", va="center", style="italic")
+        ax_m.text(0.5, 0.5, "—",
+                  transform=ax_m.transAxes,
+                  color=s["subtext"], fontsize=10,
                   ha="center", va="center")
 
     # ── draw each quarter ─────────────────────────────────────────────────────
@@ -413,7 +460,7 @@ def plot_chart(symbol, d_df, w_df, m_df, h_df, output_path):
     ]
 
     for ax_p, ax_m, df, label, key, dfmt, yside in quarters:
-        if df is not None and len(df) >= MACD_SLOW + MACD_SIGNAL + 2:
+        if df is not None and len(df) >= 1:
             draw_quarter(ax_p, ax_m, df, label, tf_colors[key], dfmt, yside)
         else:
             no_data(ax_p, ax_m, label)
