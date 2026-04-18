@@ -46,7 +46,7 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-EXCEL_FILE   = "Scrips_500.xlsx"
+EXCEL_FILE   = "Scrips_MC.xlsx"
 SYMBOL_COL   = None
 EXCHANGE_SFX = ".NS"
 OUTPUT_DIR   = "YF_4TF_500"
