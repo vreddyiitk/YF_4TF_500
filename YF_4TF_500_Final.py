@@ -2,7 +2,7 @@
 chart_generator_4tf.py
 ======================
 Reads scrip symbols from 'Scrips_500.xlsx', downloads OHLC data across four
-timeframes, and saves a single TradingView-style (Dark theme) PNG per stock.
+timeframes, and saves a single TradingView-style (Light/White theme) PNG per stock.
 
 ┌─────────────────────┬─────────────────────┐
 │  TOP-LEFT           │  TOP-RIGHT          │
@@ -15,6 +15,12 @@ timeframes, and saves a single TradingView-style (Dark theme) PNG per stock.
 │  Price + EMA9       │  Price + EMA9       │
 │  MACD (12,26,9)     │  MACD (12,26,9)     │
 └─────────────────────┴─────────────────────┘
+
+Changes vs original:
+  • ALL timeframes use GREEN (up) / RED (down) candles
+  • WHITE background (light theme throughout)
+  • Green circle below bar when MACD histogram turns positive (crosses above 0)
+  • Red circle above bar when MACD histogram turns negative (crosses below 0)
 
 Requirements:
     pip install yfinance pandas openpyxl matplotlib
@@ -29,7 +35,6 @@ import time
 import warnings
 import traceback
 from datetime import datetime, timedelta
-from typing import Optional
 
 import matplotlib
 matplotlib.use("Agg")
@@ -61,60 +66,58 @@ MACD_SIGNAL  = 9
 MAX_RETRIES  = 3
 RETRY_DELAY  = 5
 
-# Lookback multipliers to ensure N_BARS are available after fetching
-# Daily  : 100 bars × 1.6 calendar days/bar  = ~160 days
-# Weekly : 100 bars × 7 days/bar             = ~700 days
-# Monthly: fetch max available (~10 yrs) — recently listed stocks may have fewer
-# Hourly : 100 bars ÷ 6 bars/day × 1.8 buffer = ~30 days (120 for safety)
 LOOKBACK = {
     "1d":  180,
     "1wk": 730,
-    "1mo": 3650,   # 10 years – yfinance monthly goes back further but 10yr covers most NSE stocks
+    "1mo": 3650,
     "1h":  120,
 }
 
-# ── Dark TradingView palette ─────────────────
+# ── White / Light theme palette ──────────────
 STYLE = {
-    "bg":          "#131722",
-    "panel_bg":    "#1E222D",
-    "grid":        "#2A2E39",
-    "text":        "#D1D4DC",
-    "subtext":     "#787B86",
-    "border":      "#2A2E39",
-    "zero_line":   "#787B86",
-    # ── per-timeframe candle colours ─────────
-    # Daily   – classic teal / red
-    "d_up":        "#26A69A",
-    "d_dn":        "#EF5350",
-    "d_ema":       "#FF9800",
-    "d_macd":      "#2962FF",
-    "d_sig":       "#FF6D00",
-    "d_hu":        "#26A69A",
-    "d_hd":        "#EF5350",
-    # Weekly  – lime / crimson
-    "w_up":        "#66BB6A",
-    "w_dn":        "#EF5350",
-    "w_ema":       "#FFEB3B",
-    "w_macd":      "#29B6F6",
-    "w_sig":       "#FF7043",
-    "w_hu":        "#66BB6A",
-    "w_hd":        "#EF5350",
-    # Monthly – violet / orange
-    "m_up":        "#AB47BC",
-    "m_dn":        "#FF7043",
-    "m_ema":       "#00BCD4",
-    "m_macd":      "#7E57C2",
-    "m_sig":       "#FF8A65",
-    "m_hu":        "#AB47BC",
-    "m_hd":        "#FF7043",
-    # Hourly  – yellow / magenta
-    "h_up":        "#FFD700",
-    "h_dn":        "#FF00FF",
-    "h_ema":       "#00FFCC",
-    "h_macd":      "#40C4FF",
-    "h_sig":       "#FF9E40",
-    "h_hu":        "#FFD700",
-    "h_hd":        "#FF00FF",
+    # ── backgrounds
+    "bg":        "#FFFFFF",      # figure background: pure white
+    "panel_bg":  "#FAFAFA",      # axes background: off-white
+    "grid":      "#E0E0E0",      # gridlines: light grey
+
+    # ── text
+    "text":      "#1A1A2E",      # primary text: near-black
+    "subtext":   "#5A5A72",      # secondary text: muted navy-grey
+    "border":    "#CCCCCC",      # spine / divider colour
+    "zero_line": "#999999",      # MACD zero line
+
+    # ── MACD histogram direction-change markers (same in all TFs)
+    "macd_turn_bull": "#00C853",   # green circle: histogram turns positive
+    "macd_turn_bear": "#D50000",   # red circle:   histogram turns negative
+
+    # ── Candles: ALL timeframes use the same green/red
+    "up":   "#26A69A",   # green body (bullish)
+    "dn":   "#EF5350",   # red   body (bearish)
+
+    # ── per-timeframe EMA / MACD line colours (kept distinct for readability)
+    "d_ema":   "#E65100",   # deep orange
+    "d_macd":  "#1565C0",   # dark blue
+    "d_sig":   "#E65100",   # deep orange
+    "d_hu":    "#26A69A",
+    "d_hd":    "#EF5350",
+
+    "w_ema":   "#6A1B9A",   # purple
+    "w_macd":  "#0277BD",   # ocean blue
+    "w_sig":   "#AD1457",   # deep pink
+    "w_hu":    "#26A69A",
+    "w_hd":    "#EF5350",
+
+    "m_ema":   "#00695C",   # teal
+    "m_macd":  "#4527A0",   # deep violet
+    "m_sig":   "#BF360C",   # burnt orange
+    "m_hu":    "#26A69A",
+    "m_hd":    "#EF5350",
+
+    "h_ema":   "#1B5E20",   # dark green
+    "h_macd":  "#0D47A1",   # navy
+    "h_sig":   "#B71C1C",   # dark red
+    "h_hu":    "#26A69A",
+    "h_hd":    "#EF5350",
 }
 
 
@@ -164,11 +167,6 @@ def download_with_retry(ticker, start, end, interval):
 
 
 def fetch_ohlc(ticker, interval):
-    """
-    Download and clean OHLC data for a given interval.
-    Returns a DataFrame trimmed to the last N_BARS rows (or fewer if
-    the stock doesn't have that much history), or None on failure.
-    """
     end_dt   = datetime.today() + timedelta(days=1)
     start_dt = end_dt - timedelta(days=LOOKBACK[interval])
 
@@ -186,7 +184,6 @@ def fetch_ohlc(ticker, interval):
         df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
         df.index = pd.to_datetime(df.index)
 
-        # Hourly: convert UTC → IST, filter market hours, strip tz
         if interval == "1h":
             if df.index.tz is None:
                 df.index = df.index.tz_localize("UTC")
@@ -194,21 +191,10 @@ def fetch_ohlc(ticker, interval):
             df = df.between_time("09:15", "15:30")
             df.index = df.index.tz_localize(None)
 
-        # Plot whatever is available — even a single bar is useful.
-        # For monthly we accept any number of bars (min=1).
-        # For other intervals keep a small floor for MACD warm-up.
-        if interval == "1mo":
-            min_bars = 1
-        elif interval == "1h":
-            min_bars = MACD_SLOW + MACD_SIGNAL + 2
-        else:
-            min_bars = MACD_SLOW + MACD_SIGNAL + 2
-
+        min_bars = 1 if interval == "1mo" else MACD_SLOW + MACD_SIGNAL + 2
         if len(df) < min_bars:
             return None
 
-        # Use up to N_BARS — if fewer available (e.g. recently listed stock),
-        # use whatever is available rather than returning None
         return df.tail(N_BARS)
 
     except Exception:
@@ -222,57 +208,104 @@ def fetch_ohlc(ticker, interval):
 def draw_quarter(ax_price, ax_macd, df, label, colors, date_fmt, y_side="right"):
     """
     Draw candlestick + EMA9 on ax_price and MACD on ax_macd.
-    y_side : "left" for left column, "right" for right column
-    Handles any number of bars ≥ 1 gracefully.
+    Candles are always green (up) / red (down).
+    MACD histogram direction-change circles are plotted on ax_price.
     """
     s   = STYLE
     n   = len(df)
     xs  = np.arange(n)
 
-    # EMA — ewm works with any number of bars (warm-up handled internally)
     ema9 = ema(df["Close"], EMA_PERIOD)
 
-    # MACD — only compute if we have enough bars; otherwise set to None
     has_macd = n >= MACD_SLOW + MACD_SIGNAL + 2
     if has_macd:
         macd_l, sig, hist = macd_calc(df["Close"], MACD_FAST, MACD_SLOW, MACD_SIGNAL)
-    else:
-        macd_l = sig = hist = None
+        hist_vals = hist.values
 
-    # ── style both axes ───────────────────────────────────────────────────────
+        # ── MACD histogram direction-change detection ─────────────────────────
+        # "turns positive":  histogram crosses from ≤0 to >0
+        # "turns negative":  histogram crosses from ≥0 to <0
+        macd_bull_turn = np.zeros(n, dtype=bool)   # hist crosses zero upward
+        macd_bear_turn = np.zeros(n, dtype=bool)   # hist crosses zero downward
+        for i in range(1, n):
+            if hist_vals[i - 1] <= 0 and hist_vals[i] > 0:
+                macd_bull_turn[i] = True
+            if hist_vals[i - 1] >= 0 and hist_vals[i] < 0:
+                macd_bear_turn[i] = True
+    else:
+        macd_l = sig = hist = hist_vals = None
+        macd_bull_turn = np.zeros(n, dtype=bool)
+        macd_bear_turn = np.zeros(n, dtype=bool)
+
+    # ── style axes ───────────────────────────────────────────────────────────
     for ax in (ax_price, ax_macd):
         ax.set_facecolor(s["panel_bg"])
         ax.tick_params(colors=s["text"], labelsize=7, width=1.0, length=3)
         for spine in ax.spines.values():
             spine.set_edgecolor(s["border"])
-        ax.grid(True, color=s["grid"], linewidth=0.5, alpha=0.7)
+            spine.set_linewidth(0.8)
+        ax.grid(True, color=s["grid"], linewidth=0.5, alpha=0.9)
 
-    # ── minimum body height so doji candles are visible ───────────────────────
+    # ── candlesticks  (green / red, every timeframe) ──────────────────────────
     avg_range  = (df["High"] - df["Low"]).mean()
     min_body_h = avg_range * 0.04
 
-    # ── candles ───────────────────────────────────────────────────────────────
+    BODY_W = 0.6   # body half-width on each side of centre
+
     for i, (_, row) in enumerate(df.iterrows()):
         o, h, l, c = row["Open"], row["High"], row["Low"], row["Close"]
         is_bull  = c >= o
-        body_col = colors["up"] if is_bull else colors["dn"]
-        body_h   = max(abs(c - o), min_body_h)
+        body_col = s["up"] if is_bull else s["dn"]
+        body_top = max(o, c)
+        body_bot = min(o, c)
+        body_h   = max(body_top - body_bot, min_body_h)
 
-        ax_price.bar(i, h - l,   bottom=l,        width=0.06,
-                     color="#787B86", zorder=2)
-        ax_price.bar(i, body_h,  bottom=min(o, c), width=0.65,
-                     color=body_col, zorder=3)
+        # Wick — perfectly centred at i (drawn first, zorder=2)
+        ax_price.vlines(i, l, h, color=body_col, linewidth=1.2, zorder=2)
+
+        # Body — Rectangle explicitly centred at i using add_patch (zorder=3)
+        from matplotlib.patches import Rectangle as _Rect
+        rect = _Rect(
+            (i - BODY_W / 2, body_bot),   # (left_x, bottom_y)
+            BODY_W, body_h,
+            facecolor=body_col,
+            edgecolor=body_col,
+            linewidth=0,
+            zorder=3,
+        )
+        ax_price.add_patch(rect)
 
     # ── EMA ───────────────────────────────────────────────────────────────────
     ax_price.plot(xs, ema9.values, color=colors["ema"],
                   linewidth=1.8, zorder=4, label=f"EMA {EMA_PERIOD}")
 
+    # ── MACD direction-change circles on price panel ──────────────────────────
+    price_range = df["High"].max() - df["Low"].min()
+    circle_off  = price_range * 0.025   # offset below/above bar
+
+    for i in range(n):
+        if macd_bull_turn[i]:
+            # Green circle BELOW the bar low
+            ax_price.plot(xs[i], df["Low"].iloc[i] - circle_off,
+                          marker="o", markersize=8,
+                          color=s["macd_turn_bull"],
+                          markeredgecolor="white",
+                          markeredgewidth=0.8,
+                          zorder=7, linestyle="None")
+        if macd_bear_turn[i]:
+            # Red circle ABOVE the bar high
+            ax_price.plot(xs[i], df["High"].iloc[i] + circle_off,
+                          marker="o", markersize=8,
+                          color=s["macd_turn_bear"],
+                          markeredgecolor="white",
+                          markeredgewidth=0.8,
+                          zorder=7, linestyle="None")
+
     # ── axes limits ───────────────────────────────────────────────────────────
     ax_price.set_xlim(-1, n + 1)
-    pad = (df["High"].max() - df["Low"].min()) * 0.05
+    pad = (df["High"].max() - df["Low"].min()) * 0.07
     ax_price.set_ylim(df["Low"].min() - pad, df["High"].max() + pad)
 
-    # Y-axis on the correct side per column — eliminates wasted space
     ax_price.yaxis.set_label_position(y_side)
     ax_price.yaxis.tick_right() if y_side == "right" else ax_price.yaxis.tick_left()
     ax_price.set_ylabel("Price (₹)", color=s["text"], fontsize=7)
@@ -283,37 +316,39 @@ def draw_quarter(ax_price, ax_macd, df, label, colors, date_fmt, y_side="right")
     ax_macd.set_ylabel("MACD", color=s["text"], fontsize=7)
     ax_macd.yaxis.set_tick_params(labelsize=6, labelcolor=s["text"])
 
-    # ── last-price pills — always on the RIGHT edge of each axes ─────────────
-    # Left column:  pills point right into the wspace gap (wspace is wide enough)
-    # Right column: pills point right into the right figure margin
+    # ── last-price pills ──────────────────────────────────────────────────────
     last_close = df["Close"].iloc[-1]
     last_ema   = ema9.iloc[-1]
-    close_col  = colors["up"] if df["Close"].iloc[-1] >= df["Open"].iloc[-1] \
-                 else colors["dn"]
+    close_col  = s["up"] if df["Close"].iloc[-1] >= df["Open"].iloc[-1] else s["dn"]
 
     for val, col in [(last_close, close_col), (last_ema, colors["ema"])]:
         ax_price.annotate(f"₹{val:,.2f}",
                           xy=(1, val), xycoords=("axes fraction", "data"),
                           xytext=(4, 0), textcoords="offset points",
-                          fontsize=7.5, fontweight="bold", color="#131722",
+                          fontsize=7.5, fontweight="bold", color="#FFFFFF",
                           ha="left", va="center",
                           bbox=dict(boxstyle="round,pad=0.3",
                                     facecolor=col, edgecolor="none", alpha=0.97),
                           annotation_clip=False)
 
     # ── legend ────────────────────────────────────────────────────────────────
-    leg = [mpatches.Patch(facecolor=colors["up"], label="Bullish"),
-           mpatches.Patch(facecolor=colors["dn"], label="Bearish"),
-           Line2D([0],[0], color=colors["ema"], linewidth=1.5,
-                  label=f"EMA {EMA_PERIOD}")]
-    ax_price.legend(handles=leg, loc="upper left", fontsize=7,
-                    framealpha=0.7, facecolor=s["bg"],
+    leg = [
+        mpatches.Patch(facecolor=s["up"],  label="Bullish"),
+        mpatches.Patch(facecolor=s["dn"],  label="Bearish"),
+        Line2D([0],[0], color=colors["ema"], linewidth=1.5, label=f"EMA {EMA_PERIOD}"),
+        Line2D([0],[0], marker="o", color="w", markerfacecolor=s["macd_turn_bull"],
+               markersize=7, linestyle="None", label="MACD turns +ve"),
+        Line2D([0],[0], marker="o", color="w", markerfacecolor=s["macd_turn_bear"],
+               markersize=7, linestyle="None", label="MACD turns -ve"),
+    ]
+    ax_price.legend(handles=leg, loc="upper left", fontsize=6.5,
+                    framealpha=0.85, facecolor=s["bg"],
                     edgecolor=s["border"], labelcolor=s["text"])
 
-    # ── TIMEFRAME LABEL – axes title, always visible above the quadrant ───────
+    # ── timeframe label badge ─────────────────────────────────────────────────
     ax_price.set_title(f"  {label}  ",
                        loc="left",
-                       color=s["bg"],
+                       color="#FFFFFF",
                        fontsize=10, fontweight="bold",
                        pad=3,
                        bbox=dict(boxstyle="round,pad=0.35",
@@ -321,20 +356,19 @@ def draw_quarter(ax_price, ax_macd, df, label, colors, date_fmt, y_side="right")
                                  edgecolor="none",
                                  alpha=0.95))
 
-    # ── MACD ──────────────────────────────────────────────────────────────────
+    # ── MACD panel ────────────────────────────────────────────────────────────
     if has_macd:
-        hcols = [colors["hu"] if v >= 0 else colors["hd"] for v in hist.values]
-        ax_macd.bar(xs, hist.values, color=hcols, alpha=0.80, width=0.65, zorder=2)
+        hcols = [colors["hu"] if v >= 0 else colors["hd"] for v in hist_vals]
+        ax_macd.bar(xs, hist_vals, color=hcols, alpha=0.80, width=0.65, zorder=2)
         ax_macd.plot(xs, macd_l.values, color=colors["macd"], linewidth=1.0,
                      zorder=3, label="MACD")
         ax_macd.plot(xs, sig.values,    color=colors["sig"],  linewidth=0.9,
                      zorder=3, label="Signal")
-        ax_macd.axhline(0, color=s["zero_line"], linewidth=0.6, linestyle="--")
-        ax_macd.legend(loc="upper left", fontsize=6.5, framealpha=0.6,
+        ax_macd.axhline(0, color=s["zero_line"], linewidth=0.8, linestyle="--")
+        ax_macd.legend(loc="upper left", fontsize=6.5, framealpha=0.85,
                        facecolor=s["bg"], edgecolor=s["border"],
                        labelcolor=s["text"])
     else:
-        # Not enough bars for MACD — show a note
         ax_macd.set_facecolor(s["panel_bg"])
         ax_macd.set_xticks([])
         ax_macd.set_yticks([])
@@ -352,12 +386,12 @@ def draw_quarter(ax_price, ax_macd, df, label, colors, date_fmt, y_side="right")
         rotation=25, ha="right", fontsize=7, color=s["text"])
     plt.setp(ax_price.get_xticklabels(), visible=False)
 
-    # ── % change caption – bottom-right of price panel ────────────────────────
+    # ── % change caption ──────────────────────────────────────────────────────
     lc   = df["Close"].iloc[-1]
     fc   = df["Close"].iloc[0]
     pct  = (lc - fc) / fc * 100
     sign = "+" if pct >= 0 else ""
-    ccol = colors["up"] if pct >= 0 else colors["dn"]
+    ccol = s["up"] if pct >= 0 else s["dn"]
     ax_price.text(0.99, 0.02, f"{sign}{pct:.2f}%  ({n} bars)",
                   transform=ax_price.transAxes,
                   color=ccol, fontsize=7.5, fontweight="bold",
@@ -369,22 +403,8 @@ def draw_quarter(ax_price, ax_macd, df, label, colors, date_fmt, y_side="right")
 # ─────────────────────────────────────────────
 
 def plot_chart(symbol, d_df, w_df, m_df, h_df, output_path):
-    """
-    d_df, w_df, m_df, h_df : DataFrames for daily/weekly/monthly/hourly
-                              Any may be None → that quarter shows "No data"
-    """
     s = STYLE
 
-    # ── Figure: 2 rows × 2 cols, each cell split into price(70%) + MACD(30%) ─
-    # We use GridSpec with 4 rows and 2 cols:
-    #   rows 0,1 → top half  (row 0 = price, row 1 = MACD)
-    #   rows 2,3 → bot half  (row 2 = price, row 3 = MACD)
-    #   cols 0   → left
-    #   cols 1   → right
-    # ── Figure sized for 1920×1080 Full HD screen ────────────────────────────
-    # figsize(19.2, 10.4) × dpi(100) = 1920 × 1040 px
-    # 1040 instead of 1080 leaves ~40px for Windows taskbar so chart fills
-    # the screen without scrolling when viewed at 100% zoom
     fig = plt.figure(figsize=(19.2, 10.4), dpi=100, facecolor=s["bg"])
     fig.patch.set_facecolor(s["bg"])
 
@@ -393,56 +413,50 @@ def plot_chart(symbol, d_df, w_df, m_df, h_df, output_path):
         height_ratios=[7, 3, 7, 3],
         width_ratios=[1, 1],
         hspace=0.10,
-        wspace=0.14,       # wide enough for left-col right-side pill labels
+        wspace=0.14,
         top=0.93, bottom=0.05,
         left=0.02, right=0.97,
     )
 
-    # Quarter axes
-    ax_d_p  = fig.add_subplot(gs[0, 0])   # Daily   – price
-    ax_d_m  = fig.add_subplot(gs[1, 0], sharex=ax_d_p)   # Daily   – MACD
-    ax_w_p  = fig.add_subplot(gs[0, 1])   # Weekly  – price
-    ax_w_m  = fig.add_subplot(gs[1, 1], sharex=ax_w_p)   # Weekly  – MACD
-    ax_mo_p = fig.add_subplot(gs[2, 0])   # Monthly – price
-    ax_mo_m = fig.add_subplot(gs[3, 0], sharex=ax_mo_p)  # Monthly – MACD
-    ax_h_p  = fig.add_subplot(gs[2, 1])   # Hourly  – price
-    ax_h_m  = fig.add_subplot(gs[3, 1], sharex=ax_h_p)   # Hourly  – MACD
+    ax_d_p  = fig.add_subplot(gs[0, 0])
+    ax_d_m  = fig.add_subplot(gs[1, 0], sharex=ax_d_p)
+    ax_w_p  = fig.add_subplot(gs[0, 1])
+    ax_w_m  = fig.add_subplot(gs[1, 1], sharex=ax_w_p)
+    ax_mo_p = fig.add_subplot(gs[2, 0])
+    ax_mo_m = fig.add_subplot(gs[3, 0], sharex=ax_mo_p)
+    ax_h_p  = fig.add_subplot(gs[2, 1])
+    ax_h_m  = fig.add_subplot(gs[3, 1], sharex=ax_h_p)
 
-    # ── colour maps per timeframe ─────────────────────────────────────────────
+    # ── per-TF colour maps  (candle up/dn now unified; only MA/MACD differ) ───
     tf_colors = {
-        "d":  dict(up=s["d_up"],  dn=s["d_dn"],  ema=s["d_ema"],
+        "d":  dict(up=s["up"], dn=s["dn"], ema=s["d_ema"],
                    macd=s["d_macd"], sig=s["d_sig"], hu=s["d_hu"], hd=s["d_hd"]),
-        "w":  dict(up=s["w_up"],  dn=s["w_dn"],  ema=s["w_ema"],
+        "w":  dict(up=s["up"], dn=s["dn"], ema=s["w_ema"],
                    macd=s["w_macd"], sig=s["w_sig"], hu=s["w_hu"], hd=s["w_hd"]),
-        "mo": dict(up=s["m_up"],  dn=s["m_dn"],  ema=s["m_ema"],
+        "mo": dict(up=s["up"], dn=s["dn"], ema=s["m_ema"],
                    macd=s["m_macd"], sig=s["m_sig"], hu=s["m_hu"], hd=s["m_hd"]),
-        "h":  dict(up=s["h_up"],  dn=s["h_dn"],  ema=s["h_ema"],
+        "h":  dict(up=s["up"], dn=s["dn"], ema=s["h_ema"],
                    macd=s["h_macd"], sig=s["h_sig"], hu=s["h_hu"], hd=s["h_hd"]),
     }
 
-    # ── helper: show "No data" placeholder ───────────────────────────────────
-    def no_data(ax_p, ax_m, label):
-        colors = tf_colors.get(
-            {"Daily":"d","Weekly":"w","Monthly":"mo","Hourly":"h"}.get(label, "d"))
+    def no_data(ax_p, ax_m, label, key):
+        col = tf_colors[key]["ema"]
         for ax in (ax_p, ax_m):
             ax.set_facecolor(s["panel_bg"])
             for spine in ax.spines.values():
                 spine.set_edgecolor(s["border"])
-            # Hide all tick labels and ticks — prevents 0.0/0.2/0.4 showing
             ax.set_xticks([])
             ax.set_yticks([])
             ax.tick_params(left=False, right=False,
                            bottom=False, labelbottom=False,
                            labelleft=False, labelright=False)
-        # Timeframe label badge (same style as normal quarters)
         ax_p.set_title(f"  {label}  ",
-                       loc="left", color=s["bg"],
+                       loc="left", color="#FFFFFF",
                        fontsize=10, fontweight="bold", pad=3,
                        bbox=dict(boxstyle="round,pad=0.35",
-                                 facecolor=colors["ema"] if colors else s["subtext"],
-                                 edgecolor="none", alpha=0.95))
+                                 facecolor=col, edgecolor="none", alpha=0.95))
         ax_p.text(0.5, 0.5,
-                  f"No monthly data\n(recently listed stock)",
+                  "No data\n(recently listed stock)",
                   transform=ax_p.transAxes,
                   color=s["subtext"], fontsize=10,
                   ha="center", va="center", style="italic")
@@ -451,7 +465,6 @@ def plot_chart(symbol, d_df, w_df, m_df, h_df, output_path):
                   color=s["subtext"], fontsize=10,
                   ha="center", va="center")
 
-    # ── draw each quarter ─────────────────────────────────────────────────────
     quarters = [
         (ax_d_p,  ax_d_m,  d_df,  "Daily",   "d",  "%d %b '%y",   "left"),
         (ax_w_p,  ax_w_m,  w_df,  "Weekly",  "w",  "%d %b '%y",   "right"),
@@ -463,7 +476,7 @@ def plot_chart(symbol, d_df, w_df, m_df, h_df, output_path):
         if df is not None and len(df) >= 1:
             draw_quarter(ax_p, ax_m, df, label, tf_colors[key], dfmt, yside)
         else:
-            no_data(ax_p, ax_m, label)
+            no_data(ax_p, ax_m, label, key)
 
     # ── master title ──────────────────────────────────────────────────────────
     latest = (d_df.index[-1].strftime("%d %b %Y")
@@ -474,7 +487,8 @@ def plot_chart(symbol, d_df, w_df, m_df, h_df, output_path):
              f"{symbol}  |  NSE  |  Multi-Timeframe Chart",
              color=s["text"], fontsize=12, fontweight="bold")
     fig.text(0.03, 0.945,
-             f"₹{lc:,.2f}  |  {N_BARS} bars per timeframe",
+             f"₹{lc:,.2f}  |  {N_BARS} bars per timeframe  "
+             f"|  ● MACD turns +ve   ● MACD turns -ve",
              color=s["subtext"], fontsize=8)
     fig.text(0.97, 0.965,
              f"Latest: {latest}",
@@ -484,12 +498,10 @@ def plot_chart(symbol, d_df, w_df, m_df, h_df, output_path):
              f"  |  Data: yfinance",
              color=s["subtext"], fontsize=7, ha="right")
 
-    # ── quarter border lines ──────────────────────────────────────────────────
-    # Horizontal divider between top and bottom halves
+    # ── quarter dividers ──────────────────────────────────────────────────────
     fig.add_artist(plt.Line2D([0.02, 0.97], [0.50, 0.50],
                               transform=fig.transFigure,
                               color=s["border"], linewidth=1.5, alpha=0.8))
-    # Vertical divider between left and right columns
     fig.add_artist(plt.Line2D([0.50, 0.50], [0.05, 0.93],
                               transform=fig.transFigure,
                               color=s["border"], linewidth=1.5, alpha=0.8))
@@ -506,8 +518,9 @@ def plot_chart(symbol, d_df, w_df, m_df, h_df, output_path):
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     print(f"\n{'='*62}")
-    print(f"  Multi-TF Chart Generator  –  NSE  |  TradingView Dark")
+    print(f"  Multi-TF Chart Generator  –  NSE  |  White Theme")
     print(f"  Quarters: Daily · Weekly · Monthly · Hourly  |  {N_BARS} bars each")
+    print(f"  Candles: Green/Red  |  MACD turns: ● green / ● red")
     print(f"{'='*62}")
 
     if not os.path.exists(EXCEL_FILE):
