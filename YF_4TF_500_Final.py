@@ -1,70 +1,124 @@
 """
-chart_generator_4tf.py
-======================
-Reads scrip symbols from 'Scrips_500.xlsx', downloads OHLC data across four
-timeframes, and saves a single TradingView-style (Light/White theme) PNG per stock.
+chart_generator_4tf_nse.py
+==========================
+Combines:
+  • STEP 1  — Live NSE "Stocks Traded" scrape     (from nse_pipeline.py)
+  • STEP 2  — Filter EQ series, Value > ₹10 Cr    (from nse_pipeline.py)
+  • STEP 3  — 4-Timeframe charts per stock         (from chart_generator_4tf.py)
 
-┌─────────────────────┬─────────────────────┐
-│  TOP-LEFT           │  TOP-RIGHT          │
-│  Daily  – 100 bars  │  Weekly – 100 bars  │
-│  Price + EMA9       │  Price + EMA9       │
-│  MACD (12,26,9)     │  MACD (12,26,9)     │
-├─────────────────────┼─────────────────────┤
-│  BOTTOM-LEFT        │  BOTTOM-RIGHT       │
-│  Monthly– 100 bars  │  Hourly – 100 bars  │
-│  Price + EMA9       │  Price + EMA9       │
-│  MACD (12,26,9)     │  MACD (12,26,9)     │
-└─────────────────────┴─────────────────────┘
+Each chart contains 4 quadrants:
+  ┌─────────────────────┬─────────────────────┐
+  │  Daily  – 100 bars  │  Weekly – 100 bars  │
+  │  Price + EMA9       │  Price + EMA9       │
+  │  MACD (12,26,9)     │  MACD (12,26,9)     │
+  ├─────────────────────┼─────────────────────┤
+  │  Monthly– 100 bars  │  Hourly – 100 bars  │
+  │  Price + EMA9       │  Price + EMA9       │
+  │  MACD (12,26,9)     │  MACD (12,26,9)     │
+  └─────────────────────┴─────────────────────┘
 
-Changes vs original:
-  • ALL timeframes use GREEN (up) / RED (down) candles
-  • WHITE background (light theme throughout)
-  • Green circle below bar when MACD histogram turns positive (crosses above 0)
-  • Red circle above bar when MACD histogram turns negative (crosses below 0)
+  • White background, green/red candles across all timeframes
+  • Green ● below bar when MACD histogram turns positive
+  • Red   ● above bar when MACD histogram turns negative
 
 Requirements:
-    pip install yfinance pandas openpyxl matplotlib
+    pip install selenium webdriver-manager yfinance pandas openpyxl matplotlib
 
 Usage:
-    Place Scrips_500.xlsx in the same directory and run:
-        python chart_generator_4tf.py
+    python chart_generator_4tf_nse.py                  # headless browser
+    python chart_generator_4tf_nse.py --visible        # visible browser
+    python chart_generator_4tf_nse.py --from-csv FILE  # skip browser
+    python chart_generator_4tf_nse.py --min-value 50   # change ₹ Cr threshold
 """
 
+import sys
 import os
+import glob
+import json
 import time
-import warnings
+import shutil
+import datetime
+import tempfile
+import argparse
 import traceback
-from datetime import datetime, timedelta
+import warnings
+from datetime import timedelta
+
+import pandas as pd
+import numpy as np
+
+# ── Selenium ─────────────────────────────────────────────────────────────────
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.common.exceptions import TimeoutException, WebDriverException
+    from webdriver_manager.chrome import ChromeDriverManager
+    SELENIUM_OK = True
+except ImportError:
+    SELENIUM_OK = False
 
 import matplotlib
 matplotlib.use("Agg")
-import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.gridspec as gridspec
 from matplotlib.lines import Line2D
+from matplotlib.patches import Rectangle
 import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
-EXCEL_FILE   = "Scrips_500.xlsx"
-SYMBOL_COL   = None
+
+# ═══════════════════════════════════════════════════════════════
+#  CONFIG — NSE scrape  (from nse_pipeline.py)
+# ═══════════════════════════════════════════════════════════════
+
+TRADED_VALUE_MIN_CR = 10       # ₹ Crore minimum traded value filter
+
+NSE_HOME  = "https://www.nseindia.com"
+NSE_PAGE  = "https://www.nseindia.com/market-data/stocks-traded"
+NSE_APIS  = [
+    "https://www.nseindia.com/api/live-analysis-stocksTraded",
+    "https://www.nseindia.com/json/liveAnalysis/stocks-traded.json",
+]
+
+PAGE_WAIT     = 30
+API_SETTLE    = 10
+DOWNLOAD_WAIT = 40
+
+SYNC_XHR = """
+var xhr = new XMLHttpRequest();
+xhr.open('GET', arguments[0], false);
+xhr.setRequestHeader('Accept', 'application/json, text/plain, */*');
+xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+xhr.setRequestHeader('Referer',
+    'https://www.nseindia.com/market-data/stocks-traded');
+try {
+    xhr.send(null);
+    return {status: xhr.status, body: xhr.responseText};
+} catch(e) {
+    return {status: -1, body: e.toString()};
+}
+"""
+
+# ═══════════════════════════════════════════════════════════════
+#  CONFIG — Chart  (from chart_generator_4tf.py)
+# ═══════════════════════════════════════════════════════════════
+
 EXCHANGE_SFX = ".NS"
-OUTPUT_DIR   = "YF_4TF_500"
+OUTPUT_DIR   = "YF_4TF_NSE"
 
-N_BARS       = 100          # bars to plot in each quarter
-
-EMA_PERIOD   = 9
-MACD_FAST    = 12
-MACD_SLOW    = 26
-MACD_SIGNAL  = 9
-
-MAX_RETRIES  = 3
-RETRY_DELAY  = 5
+N_BARS      = 100
+EMA_PERIOD  = 9
+MACD_FAST   = 12
+MACD_SLOW   = 26
+MACD_SIGNAL = 9
+MAX_RETRIES = 3
+RETRY_DELAY = 5
 
 LOOKBACK = {
     "1d":  180,
@@ -73,70 +127,393 @@ LOOKBACK = {
     "1h":  120,
 }
 
-# ── White / Light theme palette ──────────────
 STYLE = {
-    # ── backgrounds
-    "bg":        "#FFFFFF",      # figure background: pure white
-    "panel_bg":  "#FAFAFA",      # axes background: off-white
-    "grid":      "#E0E0E0",      # gridlines: light grey
-
-    # ── text
-    "text":      "#1A1A2E",      # primary text: near-black
-    "subtext":   "#5A5A72",      # secondary text: muted navy-grey
-    "border":    "#CCCCCC",      # spine / divider colour
-    "zero_line": "#999999",      # MACD zero line
-
-    # ── MACD histogram direction-change markers (same in all TFs)
-    "macd_turn_bull": "#00C853",   # green circle: histogram turns positive
-    "macd_turn_bear": "#D50000",   # red circle:   histogram turns negative
-
-    # ── Candles: ALL timeframes use the same green/red
-    "up":   "#26A69A",   # green body (bullish)
-    "dn":   "#EF5350",   # red   body (bearish)
-
-    # ── per-timeframe EMA / MACD line colours (kept distinct for readability)
-    "d_ema":   "#E65100",   # deep orange
-    "d_macd":  "#1565C0",   # dark blue
-    "d_sig":   "#E65100",   # deep orange
-    "d_hu":    "#26A69A",
-    "d_hd":    "#EF5350",
-
-    "w_ema":   "#6A1B9A",   # purple
-    "w_macd":  "#0277BD",   # ocean blue
-    "w_sig":   "#AD1457",   # deep pink
-    "w_hu":    "#26A69A",
-    "w_hd":    "#EF5350",
-
-    "m_ema":   "#00695C",   # teal
-    "m_macd":  "#4527A0",   # deep violet
-    "m_sig":   "#BF360C",   # burnt orange
-    "m_hu":    "#26A69A",
-    "m_hd":    "#EF5350",
-
-    "h_ema":   "#1B5E20",   # dark green
-    "h_macd":  "#0D47A1",   # navy
-    "h_sig":   "#B71C1C",   # dark red
-    "h_hu":    "#26A69A",
-    "h_hd":    "#EF5350",
+    "bg":             "#FFFFFF",
+    "panel_bg":       "#FAFAFA",
+    "grid":           "#E0E0E0",
+    "text":           "#1A1A2E",
+    "subtext":        "#5A5A72",
+    "border":         "#CCCCCC",
+    "zero_line":      "#999999",
+    "macd_turn_bull": "#00C853",
+    "macd_turn_bear": "#D50000",
+    "up":             "#26A69A",
+    "dn":             "#EF5350",
+    "d_ema":  "#E65100", "d_macd": "#1565C0", "d_sig": "#E65100",
+    "d_hu":   "#26A69A", "d_hd":   "#EF5350",
+    "w_ema":  "#6A1B9A", "w_macd": "#0277BD", "w_sig": "#AD1457",
+    "w_hu":   "#26A69A", "w_hd":   "#EF5350",
+    "m_ema":  "#00695C", "m_macd": "#4527A0", "m_sig": "#BF360C",
+    "m_hu":   "#26A69A", "m_hd":   "#EF5350",
+    "h_ema":  "#1B5E20", "h_macd": "#0D47A1", "h_sig": "#B71C1C",
+    "h_hu":   "#26A69A", "h_hd":   "#EF5350",
 }
 
 
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  STEP 1A — BROWSER SETUP  (from nse_pipeline.py)
+# ═══════════════════════════════════════════════════════════════
 
-def read_symbols(path, col):
-    df = pd.read_excel(path, sheet_name=0)
-    if col and col in df.columns:
-        return df[col].dropna().astype(str).str.strip().tolist()
-    for c in df.columns:
-        sample = df[c].dropna().astype(str).str.strip()
-        mask   = sample.str.match(r'^[A-Z0-9&\-]{2,20}$')
-        if mask.sum() > len(sample) * 0.5:
-            print(f"  Auto-detected symbol column: '{c}'")
-            return sample[mask].tolist()
-    return df.iloc[:, 0].dropna().astype(str).str.strip().tolist()
+def build_driver(headless: bool, download_dir: str):
+    if not SELENIUM_OK:
+        print("[ERROR] selenium / webdriver-manager not installed.")
+        print("  Fix: pip install selenium webdriver-manager")
+        sys.exit(1)
 
+    opts = Options()
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-setuid-sandbox")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+    if headless:
+        opts.add_argument("--headless=new")
+
+    opts.add_experimental_option("prefs", {
+        "download.default_directory":   download_dir,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade":   True,
+        "safebrowsing.enabled":         True,
+    })
+
+    try:
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=opts,
+        )
+        print("  ✔  ChromeDriver ready (webdriver-manager)")
+        return driver
+    except Exception as e:
+        print(f"  [WARN] webdriver-manager failed: {e}")
+
+    try:
+        driver = webdriver.Chrome(options=opts)
+        print("  ✔  ChromeDriver ready (system)")
+        return driver
+    except Exception as e:
+        print(f"\n[ERROR] Chrome unavailable: {e}")
+        sys.exit(1)
+
+
+def patch_driver(driver):
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": "Object.defineProperty(navigator,'webdriver',"
+                       "{get:()=>undefined});"}
+        )
+    except Exception:
+        pass
+
+
+def warm_session(driver):
+    print("  [1/3]  Loading NSE homepage …")
+    driver.get(NSE_HOME)
+    time.sleep(4)
+    print(f"         Cookies: {[c['name'] for c in driver.get_cookies()]}")
+
+    print("  [2/3]  Loading Stocks Traded page …")
+    driver.get(NSE_PAGE)
+    try:
+        WebDriverWait(driver, PAGE_WAIT).until(
+            EC.presence_of_element_located(
+                (By.XPATH,
+                 "//*[@id='cm_9'] | "
+                 "//h2[contains(text(),'Stocks Traded')] | "
+                 "//*[contains(text(),'Stocks Traded') and "
+                 "    not(contains(@class,'nav'))]")
+            )
+        )
+        print("         Page loaded ✔")
+    except TimeoutException:
+        print("         [WARN] timeout — continuing")
+
+    print(f"         Settling {API_SETTLE}s for XHR to complete …")
+    time.sleep(API_SETTLE)
+    print(f"         Cookies: {[c['name'] for c in driver.get_cookies()]}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  STEP 1B — XHR DATA FETCH  (from nse_pipeline.py)
+# ═══════════════════════════════════════════════════════════════
+
+def _find_records_in_json(payload) -> list:
+    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+        if any(k in payload[0] for k in ("symbol", "Symbol", "SYMBOL")):
+            return payload
+    if isinstance(payload, dict):
+        for key in ("data", "stocksTradedData", "result", "rows",
+                    "stockData", "DATA", "records", "stocks", "dataList"):
+            val = payload.get(key)
+            if isinstance(val, list) and val and isinstance(val[0], dict):
+                return val
+    return []
+
+
+def fetch_via_xhr(driver) -> list:
+    print("  [3/3]  Calling NSE API via sync XHR …")
+    for url in NSE_APIS:
+        print(f"         → {url}")
+        try:
+            res    = driver.execute_script(SYNC_XHR, url)
+            status = res.get("status", -1)
+            body   = res.get("body", "")
+            print(f"           HTTP {status}  |  {len(body):,} chars")
+            if status != 200 or not body:
+                continue
+            payload = json.loads(body)
+            if isinstance(payload, dict):
+                print(f"           JSON keys: {list(payload.keys())}")
+            records = _find_records_in_json(payload)
+            if records:
+                print(f"  ✔  {len(records)} records via XHR")
+                print(f"     Fields: {list(records[0].keys())[:10]}")
+                return records
+            else:
+                print("           No stock list found in response")
+        except json.JSONDecodeError as e:
+            print(f"           JSON error: {e}")
+        except Exception as e:
+            print(f"           Error: {e}")
+    return []
+
+
+# ═══════════════════════════════════════════════════════════════
+#  STEP 1C — CSV BUTTON FALLBACK  (from nse_pipeline.py)
+# ═══════════════════════════════════════════════════════════════
+
+def _wait_for_csv(dl_dir: str) -> str:
+    print(f"         Waiting {DOWNLOAD_WAIT}s for file", end="", flush=True)
+    deadline = time.time() + DOWNLOAD_WAIT
+    while time.time() < deadline:
+        time.sleep(1)
+        print(".", end="", flush=True)
+        files = [
+            f for f in
+            glob.glob(os.path.join(dl_dir, "*.csv")) +
+            glob.glob(os.path.join(dl_dir, "*.CSV"))
+            if not f.endswith(".crdownload")
+        ]
+        if files:
+            latest = max(files, key=os.path.getmtime)
+            print(f"\n  ✔  {os.path.basename(latest)}")
+            return latest
+    print("\n  Timed out.")
+    return ""
+
+
+def fetch_via_csv_button(driver, dl_dir: str) -> str:
+    print("  CSV button fallback …")
+    xpaths = [
+        "//a[contains(@onclick,'StocksTraded-download')]",
+        "//a[contains(@onclick,'StocksTraded')]",
+        ".//a[.//img[contains(@src,'xls') or contains(@src,'csv')]]",
+        "//a[contains(@onclick,'download') and "
+        "    not(contains(@onclick,'First')) and "
+        "    not(contains(@onclick,'Prev')) and "
+        "    not(contains(@onclick,'Next'))]",
+    ]
+    for xpath in xpaths:
+        try:
+            for el in driver.find_elements(By.XPATH, xpath):
+                if el.is_displayed():
+                    print(f"  Clicking: {el.get_attribute('outerHTML')[:100]}")
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView(true);", el)
+                    time.sleep(0.5)
+                    driver.execute_script("arguments[0].click();", el)
+                    path = _wait_for_csv(dl_dir)
+                    if path:
+                        return path
+        except Exception:
+            continue
+    try:
+        driver.execute_script("downloadCSV('StocksTraded-download');")
+        return _wait_for_csv(dl_dir)
+    except Exception as e:
+        print(f"  JS call failed: {e}")
+    return ""
+
+
+# ═══════════════════════════════════════════════════════════════
+#  STEP 1D — NORMALISE  (from nse_pipeline.py)
+# ═══════════════════════════════════════════════════════════════
+
+def safe_num(v) -> float:
+    try:
+        return float(str(v).replace(",", "").replace("–", "0")
+                     .replace("−", "0").strip())
+    except Exception:
+        return 0.0
+
+
+def normalise_json(records: list) -> pd.DataFrame:
+    rows = []
+    for d in records:
+        sym = str(d.get("symbol", d.get("Symbol", ""))).strip()
+        if not sym:
+            continue
+        tv_raw = safe_num(d.get("totalTradedValue", d.get("tradedValue", 0)))
+        vol    = safe_num(d.get("totalTradedVolume", d.get("tradedQuantity", 0)))
+        rows.append({
+            "Symbol":           sym,
+            "Company":          str(d.get("companyName", "")).strip(),
+            "Series":           str(d.get("series", "EQ")).strip(),
+            "LTP (₹)":          round(safe_num(d.get("lastPrice",
+                                     d.get("closePrice", 0))), 2),
+            "% Change":         round(safe_num(d.get("pChange", 0)), 2),
+            "Mkt Cap (₹ Cr)":   round(safe_num(d.get("marketCap",
+                                     d.get("market_cap", 0))), 2),
+            "Volume (Lakhs)":   round(vol / 1e5, 2),
+            "Value (₹ Crores)": round(tv_raw / 1e7, 2),
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df.sort_values("Value (₹ Crores)", ascending=False, inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        df.index += 1
+    return df
+
+
+def normalise_csv(path: str) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(path, thousands=",")
+    except Exception as e:
+        print(f"  CSV read error: {e}")
+        return pd.DataFrame()
+
+    df.columns = df.columns.str.strip()
+    print(f"  CSV columns: {list(df.columns)}")
+
+    col_map = {}
+    for col in df.columns:
+        cl = col.lower().strip()
+        if cl == "symbol":
+            col_map[col] = "Symbol"
+        elif cl == "series":
+            col_map[col] = "Series"
+        elif cl in ("ltp", "last price", "close", "lastprice"):
+            col_map[col] = "LTP (₹)"
+        elif cl in ("%chng", "%change", "% change", "pchange",
+                    "% chng", "per change", "%chg"):
+            col_map[col] = "% Change"
+        elif "mkt cap" in cl or "market cap" in cl:
+            col_map[col] = "Mkt Cap (₹ Cr)"
+        elif "volume" in cl:
+            col_map[col] = "Volume (Lakhs)"
+        elif "value" in cl:
+            col_map[col] = "Value (₹ Crores)"
+        elif "company" in cl or cl == "name":
+            col_map[col] = "Company"
+
+    df.rename(columns=col_map, inplace=True)
+
+    for col in ["LTP (₹)", "% Change", "Mkt Cap (₹ Cr)",
+                "Volume (Lakhs)", "Value (₹ Crores)"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace(",", "", regex=False).str.strip(),
+                errors="coerce"
+            ).fillna(0)
+
+    for col, default in [("Company", ""), ("Series", "EQ"),
+                         ("Mkt Cap (₹ Cr)", 0.0)]:
+        if col not in df.columns:
+            df[col] = default
+
+    if "Value (₹ Crores)" in df.columns:
+        df.sort_values("Value (₹ Crores)", ascending=False, inplace=True)
+
+    df.reset_index(drop=True, inplace=True)
+    df.index += 1
+    print(f"  {len(df)} rows loaded from CSV")
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════
+#  STEP 1 — MASTER DOWNLOAD  (from nse_pipeline.py)
+# ═══════════════════════════════════════════════════════════════
+
+def download_nse_data(headless: bool, from_csv: str) -> pd.DataFrame:
+    if from_csv:
+        print(f"\n  Loading manual CSV: {from_csv}")
+        df = normalise_csv(from_csv)
+        if df.empty:
+            print("  [ERROR] CSV empty or unreadable.")
+            sys.exit(1)
+        return df
+
+    if not SELENIUM_OK:
+        print("[ERROR] selenium not installed.")
+        sys.exit(1)
+
+    dl_dir = tempfile.mkdtemp()
+    driver = build_driver(headless, dl_dir)
+    driver.set_page_load_timeout(60)
+    patch_driver(driver)
+    df = pd.DataFrame()
+
+    try:
+        warm_session(driver)
+        records = fetch_via_xhr(driver)
+        if records:
+            df = normalise_json(records)
+        if df.empty:
+            print("\n  XHR returned no data — trying CSV button …")
+            csv_path = fetch_via_csv_button(driver, dl_dir)
+            if csv_path:
+                df = normalise_csv(csv_path)
+    except WebDriverException as e:
+        print(f"\n[ERROR] WebDriver: {e}")
+    finally:
+        driver.quit()
+        shutil.rmtree(dl_dir, ignore_errors=True)
+        print("  Browser closed.")
+
+    if df.empty:
+        print("\n  ✗  Could not retrieve data from NSE.")
+        print(f"  MANUAL FALLBACK:")
+        print(f"  1. Open {NSE_PAGE} in Chrome")
+        print("  2. Click the ↓ CSV button")
+        print("  3. Run: python chart_generator_4tf_nse.py --from-csv StocksTraded.csv")
+        sys.exit(1)
+
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════
+#  STEP 2 — FILTER  (from nse_pipeline.py)
+# ═══════════════════════════════════════════════════════════════
+
+def filter_stocks(df: pd.DataFrame, min_value_cr: float) -> pd.DataFrame:
+    print(f"\n  Top 5 by Value before filter:")
+    top5 = df[df["Value (₹ Crores)"] > 0].nlargest(5, "Value (₹ Crores)")
+    for _, r in top5.iterrows():
+        print(f"    {r['Symbol']:<12}  ₹{r['Value (₹ Crores)']:>10,.2f} Cr"
+              f"  Series={r['Series']}")
+
+    mask = (
+        (df["Series"].str.strip().str.upper() == "EQ") &
+        (df["Value (₹ Crores)"] > min_value_cr)
+    )
+    out = df[mask].copy()
+    out.sort_values("Value (₹ Crores)", ascending=False, inplace=True)
+    out.reset_index(drop=True, inplace=True)
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════
+#  STEP 3 — CHART HELPERS  (from chart_generator_4tf.py)
+# ═══════════════════════════════════════════════════════════════
 
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
@@ -167,7 +544,7 @@ def download_with_retry(ticker, start, end, interval):
 
 
 def fetch_ohlc(ticker, interval):
-    end_dt   = datetime.today() + timedelta(days=1)
+    end_dt   = datetime.datetime.today() + timedelta(days=1)
     start_dt = end_dt - timedelta(days=LOOKBACK[interval])
 
     try:
@@ -201,32 +578,23 @@ def fetch_ohlc(ticker, interval):
         return None
 
 
-# ─────────────────────────────────────────────
-# DRAW ONE QUARTER
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  STEP 3 — DRAW ONE QUADRANT  (from chart_generator_4tf.py)
+# ═══════════════════════════════════════════════════════════════
 
 def draw_quarter(ax_price, ax_macd, df, label, colors, date_fmt, y_side="right"):
-    """
-    Draw candlestick + EMA9 on ax_price and MACD on ax_macd.
-    Candles are always green (up) / red (down).
-    MACD histogram direction-change circles are plotted on ax_price.
-    """
-    s   = STYLE
-    n   = len(df)
-    xs  = np.arange(n)
+    s  = STYLE
+    n  = len(df)
+    xs = np.arange(n)
 
     ema9 = ema(df["Close"], EMA_PERIOD)
 
     has_macd = n >= MACD_SLOW + MACD_SIGNAL + 2
     if has_macd:
-        macd_l, sig, hist = macd_calc(df["Close"], MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+        macd_l, sig, hist = macd_calc(df["Close"])
         hist_vals = hist.values
-
-        # ── MACD histogram direction-change detection ─────────────────────────
-        # "turns positive":  histogram crosses from ≤0 to >0
-        # "turns negative":  histogram crosses from ≥0 to <0
-        macd_bull_turn = np.zeros(n, dtype=bool)   # hist crosses zero upward
-        macd_bear_turn = np.zeros(n, dtype=bool)   # hist crosses zero downward
+        macd_bull_turn = np.zeros(n, dtype=bool)
+        macd_bear_turn = np.zeros(n, dtype=bool)
         for i in range(1, n):
             if hist_vals[i - 1] <= 0 and hist_vals[i] > 0:
                 macd_bull_turn[i] = True
@@ -234,10 +602,9 @@ def draw_quarter(ax_price, ax_macd, df, label, colors, date_fmt, y_side="right")
                 macd_bear_turn[i] = True
     else:
         macd_l = sig = hist = hist_vals = None
-        macd_bull_turn = np.zeros(n, dtype=bool)
-        macd_bear_turn = np.zeros(n, dtype=bool)
+        macd_bull_turn = macd_bear_turn = np.zeros(n, dtype=bool)
 
-    # ── style axes ───────────────────────────────────────────────────────────
+    # ── Style axes ───────────────────────────────────────────────────────────
     for ax in (ax_price, ax_macd):
         ax.set_facecolor(s["panel_bg"])
         ax.tick_params(colors=s["text"], labelsize=7, width=1.0, length=3)
@@ -246,139 +613,127 @@ def draw_quarter(ax_price, ax_macd, df, label, colors, date_fmt, y_side="right")
             spine.set_linewidth(0.8)
         ax.grid(True, color=s["grid"], linewidth=0.5, alpha=0.9)
 
-    # ── candlesticks  (green / red, every timeframe) ──────────────────────────
+    # ── Candlesticks: vlines wick + Rectangle body ────────────────────────────
     avg_range  = (df["High"] - df["Low"]).mean()
     min_body_h = avg_range * 0.04
+    BODY_W     = 0.6
 
-    BODY_W = 0.6   # body half-width on each side of centre
+    opens  = df["Open"].values
+    closes = df["Close"].values
+    highs  = df["High"].values
+    lows   = df["Low"].values
 
-    for i, (_, row) in enumerate(df.iterrows()):
-        o, h, l, c = row["Open"], row["High"], row["Low"], row["Close"]
-        is_bull  = c >= o
-        body_col = s["up"] if is_bull else s["dn"]
-        body_top = max(o, c)
-        body_bot = min(o, c)
-        body_h   = max(body_top - body_bot, min_body_h)
+    bull_mask  = closes >= opens
+    bear_mask  = ~bull_mask
+    body_tops  = np.maximum(opens, closes)
+    body_bots  = np.minimum(opens, closes)
+    doji       = (body_tops - body_bots) < min_body_h
+    body_tops  = np.where(doji, body_bots + min_body_h, body_tops)
 
-        # Wick — perfectly centred at i (drawn first, zorder=2)
-        ax_price.vlines(i, l, h, color=body_col, linewidth=1.2, zorder=2)
+    # Wicks first (thin, same colour as body, exactly at xs[i])
+    if bull_mask.any():
+        ax_price.vlines(xs[bull_mask], lows[bull_mask], highs[bull_mask],
+                        color=s["up"], linewidth=1.0, zorder=2)
+    if bear_mask.any():
+        ax_price.vlines(xs[bear_mask], lows[bear_mask], highs[bear_mask],
+                        color=s["dn"], linewidth=1.0, zorder=2)
 
-        # Body — Rectangle explicitly centred at i using add_patch (zorder=3)
-        from matplotlib.patches import Rectangle as _Rect
-        rect = _Rect(
-            (i - BODY_W / 2, body_bot),   # (left_x, bottom_y)
-            BODY_W, body_h,
-            facecolor=body_col,
-            edgecolor=body_col,
-            linewidth=0,
-            zorder=3,
-        )
-        ax_price.add_patch(rect)
+    # Bodies — Rectangle centred exactly at xs[i] (no bar() alignment drift)
+    for i in range(n):
+        bc = s["up"] if bull_mask[i] else s["dn"]
+        ax_price.add_patch(Rectangle(
+            (xs[i] - BODY_W / 2, body_bots[i]),
+            BODY_W, body_tops[i] - body_bots[i],
+            facecolor=bc, edgecolor=bc, linewidth=0, zorder=3,
+        ))
 
     # ── EMA ───────────────────────────────────────────────────────────────────
     ax_price.plot(xs, ema9.values, color=colors["ema"],
                   linewidth=1.8, zorder=4, label=f"EMA {EMA_PERIOD}")
 
-    # ── MACD direction-change circles on price panel ──────────────────────────
+    # ── MACD turn circles on price panel ─────────────────────────────────────
     price_range = df["High"].max() - df["Low"].min()
-    circle_off  = price_range * 0.025   # offset below/above bar
-
+    circle_off  = price_range * 0.025
     for i in range(n):
         if macd_bull_turn[i]:
-            # Green circle BELOW the bar low
-            ax_price.plot(xs[i], df["Low"].iloc[i] - circle_off,
+            ax_price.plot(xs[i], lows[i] - circle_off,
                           marker="o", markersize=8,
-                          color=s["macd_turn_bull"],
-                          markeredgecolor="white",
-                          markeredgewidth=0.8,
-                          zorder=7, linestyle="None")
+                          color=s["macd_turn_bull"], markeredgecolor="white",
+                          markeredgewidth=0.8, zorder=7, linestyle="None")
         if macd_bear_turn[i]:
-            # Red circle ABOVE the bar high
-            ax_price.plot(xs[i], df["High"].iloc[i] + circle_off,
+            ax_price.plot(xs[i], highs[i] + circle_off,
                           marker="o", markersize=8,
-                          color=s["macd_turn_bear"],
-                          markeredgecolor="white",
-                          markeredgewidth=0.8,
-                          zorder=7, linestyle="None")
+                          color=s["macd_turn_bear"], markeredgecolor="white",
+                          markeredgewidth=0.8, zorder=7, linestyle="None")
 
-    # ── axes limits ───────────────────────────────────────────────────────────
+    # ── Axes limits ───────────────────────────────────────────────────────────
     ax_price.set_xlim(-1, n + 1)
-    pad = (df["High"].max() - df["Low"].min()) * 0.07
+    pad = price_range * 0.07
     ax_price.set_ylim(df["Low"].min() - pad, df["High"].max() + pad)
-
     ax_price.yaxis.set_label_position(y_side)
     ax_price.yaxis.tick_right() if y_side == "right" else ax_price.yaxis.tick_left()
     ax_price.set_ylabel("Price (₹)", color=s["text"], fontsize=7)
     ax_price.yaxis.set_tick_params(labelsize=7, labelcolor=s["text"])
-
     ax_macd.yaxis.set_label_position(y_side)
     ax_macd.yaxis.tick_right() if y_side == "right" else ax_macd.yaxis.tick_left()
     ax_macd.set_ylabel("MACD", color=s["text"], fontsize=7)
     ax_macd.yaxis.set_tick_params(labelsize=6, labelcolor=s["text"])
 
-    # ── last-price pills ──────────────────────────────────────────────────────
+    # ── Price pills ───────────────────────────────────────────────────────────
     last_close = df["Close"].iloc[-1]
     last_ema   = ema9.iloc[-1]
-    close_col  = s["up"] if df["Close"].iloc[-1] >= df["Open"].iloc[-1] else s["dn"]
-
+    close_col  = s["up"] if last_close >= df["Open"].iloc[-1] else s["dn"]
     for val, col in [(last_close, close_col), (last_ema, colors["ema"])]:
         ax_price.annotate(f"₹{val:,.2f}",
                           xy=(1, val), xycoords=("axes fraction", "data"),
                           xytext=(4, 0), textcoords="offset points",
                           fontsize=7.5, fontweight="bold", color="#FFFFFF",
-                          ha="left", va="center",
+                          ha="left", va="center", annotation_clip=False,
                           bbox=dict(boxstyle="round,pad=0.3",
-                                    facecolor=col, edgecolor="none", alpha=0.97),
-                          annotation_clip=False)
+                                    facecolor=col, edgecolor="none", alpha=0.97))
 
-    # ── legend ────────────────────────────────────────────────────────────────
+    # ── Legend ────────────────────────────────────────────────────────────────
     leg = [
-        mpatches.Patch(facecolor=s["up"],  label="Bullish"),
-        mpatches.Patch(facecolor=s["dn"],  label="Bearish"),
-        Line2D([0],[0], color=colors["ema"], linewidth=1.5, label=f"EMA {EMA_PERIOD}"),
+        mpatches.Patch(facecolor=s["up"], label="Bullish"),
+        mpatches.Patch(facecolor=s["dn"], label="Bearish"),
+        Line2D([0],[0], color=colors["ema"], lw=1.5, label=f"EMA {EMA_PERIOD}"),
         Line2D([0],[0], marker="o", color="w", markerfacecolor=s["macd_turn_bull"],
-               markersize=7, linestyle="None", label="MACD turns +ve"),
+               ms=7, ls="None", label="MACD turns +ve"),
         Line2D([0],[0], marker="o", color="w", markerfacecolor=s["macd_turn_bear"],
-               markersize=7, linestyle="None", label="MACD turns -ve"),
+               ms=7, ls="None", label="MACD turns -ve"),
     ]
     ax_price.legend(handles=leg, loc="upper left", fontsize=6.5,
                     framealpha=0.85, facecolor=s["bg"],
                     edgecolor=s["border"], labelcolor=s["text"])
 
-    # ── timeframe label badge ─────────────────────────────────────────────────
-    ax_price.set_title(f"  {label}  ",
-                       loc="left",
-                       color="#FFFFFF",
-                       fontsize=10, fontweight="bold",
-                       pad=3,
+    # ── Timeframe badge ───────────────────────────────────────────────────────
+    ax_price.set_title(f"  {label}  ", loc="left", color="#FFFFFF",
+                       fontsize=10, fontweight="bold", pad=3,
                        bbox=dict(boxstyle="round,pad=0.35",
                                  facecolor=colors["ema"],
-                                 edgecolor="none",
-                                 alpha=0.95))
+                                 edgecolor="none", alpha=0.95))
 
     # ── MACD panel ────────────────────────────────────────────────────────────
     if has_macd:
         hcols = [colors["hu"] if v >= 0 else colors["hd"] for v in hist_vals]
         ax_macd.bar(xs, hist_vals, color=hcols, alpha=0.80, width=0.65, zorder=2)
-        ax_macd.plot(xs, macd_l.values, color=colors["macd"], linewidth=1.0,
+        ax_macd.plot(xs, macd_l.values, color=colors["macd"], lw=1.0,
                      zorder=3, label="MACD")
-        ax_macd.plot(xs, sig.values,    color=colors["sig"],  linewidth=0.9,
+        ax_macd.plot(xs, sig.values,    color=colors["sig"],  lw=0.9,
                      zorder=3, label="Signal")
-        ax_macd.axhline(0, color=s["zero_line"], linewidth=0.8, linestyle="--")
+        ax_macd.axhline(0, color=s["zero_line"], lw=0.8, ls="--")
         ax_macd.legend(loc="upper left", fontsize=6.5, framealpha=0.85,
                        facecolor=s["bg"], edgecolor=s["border"],
                        labelcolor=s["text"])
     else:
         ax_macd.set_facecolor(s["panel_bg"])
-        ax_macd.set_xticks([])
-        ax_macd.set_yticks([])
+        ax_macd.set_xticks([]); ax_macd.set_yticks([])
         ax_macd.text(0.5, 0.5,
                      f"MACD needs ≥{MACD_SLOW + MACD_SIGNAL + 2} bars  (have {n})",
-                     transform=ax_macd.transAxes,
-                     color=s["subtext"], fontsize=7, ha="center", va="center",
-                     style="italic")
+                     transform=ax_macd.transAxes, color=s["subtext"],
+                     fontsize=7, ha="center", va="center", style="italic")
 
-    # ── x-axis labels ─────────────────────────────────────────────────────────
+    # ── X-axis labels ─────────────────────────────────────────────────────────
     step = max(n // 8, 1)
     ax_macd.set_xticks(xs[::step])
     ax_macd.set_xticklabels(
@@ -387,20 +742,17 @@ def draw_quarter(ax_price, ax_macd, df, label, colors, date_fmt, y_side="right")
     plt.setp(ax_price.get_xticklabels(), visible=False)
 
     # ── % change caption ──────────────────────────────────────────────────────
-    lc   = df["Close"].iloc[-1]
-    fc   = df["Close"].iloc[0]
-    pct  = (lc - fc) / fc * 100
-    sign = "+" if pct >= 0 else ""
-    ccol = s["up"] if pct >= 0 else s["dn"]
-    ax_price.text(0.99, 0.02, f"{sign}{pct:.2f}%  ({n} bars)",
+    lc  = df["Close"].iloc[-1]; fc = df["Close"].iloc[0]
+    pct = (lc - fc) / fc * 100
+    ax_price.text(0.99, 0.02, f"{'+' if pct>=0 else ''}{pct:.2f}%  ({n} bars)",
                   transform=ax_price.transAxes,
-                  color=ccol, fontsize=7.5, fontweight="bold",
-                  ha="right", va="bottom")
+                  color=s["up"] if pct >= 0 else s["dn"],
+                  fontsize=7.5, fontweight="bold", ha="right", va="bottom")
 
 
-# ─────────────────────────────────────────────
-# MASTER CHART  (4 quarters)
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  STEP 3 — 4-QUADRANT MASTER CHART  (from chart_generator_4tf.py)
+# ═══════════════════════════════════════════════════════════════
 
 def plot_chart(symbol, d_df, w_df, m_df, h_df, output_path):
     s = STYLE
@@ -408,15 +760,12 @@ def plot_chart(symbol, d_df, w_df, m_df, h_df, output_path):
     fig = plt.figure(figsize=(19.2, 10.4), dpi=100, facecolor=s["bg"])
     fig.patch.set_facecolor(s["bg"])
 
-    gs = gridspec.GridSpec(
-        4, 2,
-        height_ratios=[7, 3, 7, 3],
-        width_ratios=[1, 1],
-        hspace=0.10,
-        wspace=0.14,
-        top=0.93, bottom=0.05,
-        left=0.02, right=0.97,
-    )
+    gs = gridspec.GridSpec(4, 2,
+                           height_ratios=[7, 3, 7, 3],
+                           width_ratios=[1, 1],
+                           hspace=0.10, wspace=0.14,
+                           top=0.93, bottom=0.05,
+                           left=0.02, right=0.97)
 
     ax_d_p  = fig.add_subplot(gs[0, 0])
     ax_d_m  = fig.add_subplot(gs[1, 0], sharex=ax_d_p)
@@ -427,7 +776,6 @@ def plot_chart(symbol, d_df, w_df, m_df, h_df, output_path):
     ax_h_p  = fig.add_subplot(gs[2, 1])
     ax_h_m  = fig.add_subplot(gs[3, 1], sharex=ax_h_p)
 
-    # ── per-TF colour maps  (candle up/dn now unified; only MA/MACD differ) ───
     tf_colors = {
         "d":  dict(up=s["up"], dn=s["dn"], ema=s["d_ema"],
                    macd=s["d_macd"], sig=s["d_sig"], hu=s["d_hu"], hd=s["d_hd"]),
@@ -445,25 +793,18 @@ def plot_chart(symbol, d_df, w_df, m_df, h_df, output_path):
             ax.set_facecolor(s["panel_bg"])
             for spine in ax.spines.values():
                 spine.set_edgecolor(s["border"])
-            ax.set_xticks([])
-            ax.set_yticks([])
-            ax.tick_params(left=False, right=False,
-                           bottom=False, labelbottom=False,
-                           labelleft=False, labelright=False)
-        ax_p.set_title(f"  {label}  ",
-                       loc="left", color="#FFFFFF",
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.tick_params(left=False, right=False, bottom=False,
+                           labelbottom=False, labelleft=False, labelright=False)
+        ax_p.set_title(f"  {label}  ", loc="left", color="#FFFFFF",
                        fontsize=10, fontweight="bold", pad=3,
                        bbox=dict(boxstyle="round,pad=0.35",
                                  facecolor=col, edgecolor="none", alpha=0.95))
-        ax_p.text(0.5, 0.5,
-                  "No data\n(recently listed stock)",
-                  transform=ax_p.transAxes,
-                  color=s["subtext"], fontsize=10,
-                  ha="center", va="center", style="italic")
-        ax_m.text(0.5, 0.5, "—",
-                  transform=ax_m.transAxes,
-                  color=s["subtext"], fontsize=10,
-                  ha="center", va="center")
+        ax_p.text(0.5, 0.5, "No data\n(recently listed stock)",
+                  transform=ax_p.transAxes, color=s["subtext"],
+                  fontsize=10, ha="center", va="center", style="italic")
+        ax_m.text(0.5, 0.5, "—", transform=ax_m.transAxes,
+                  color=s["subtext"], fontsize=10, ha="center", va="center")
 
     quarters = [
         (ax_d_p,  ax_d_m,  d_df,  "Daily",   "d",  "%d %b '%y",   "left"),
@@ -478,7 +819,7 @@ def plot_chart(symbol, d_df, w_df, m_df, h_df, output_path):
         else:
             no_data(ax_p, ax_m, label, key)
 
-    # ── master title ──────────────────────────────────────────────────────────
+    # ── Master title ──────────────────────────────────────────────────────────
     latest = (d_df.index[-1].strftime("%d %b %Y")
               if d_df is not None and not d_df.empty else "–")
     lc = (d_df["Close"].iloc[-1] if d_df is not None and not d_df.empty else 0)
@@ -487,18 +828,16 @@ def plot_chart(symbol, d_df, w_df, m_df, h_df, output_path):
              f"{symbol}  |  NSE  |  Multi-Timeframe Chart",
              color=s["text"], fontsize=12, fontweight="bold")
     fig.text(0.03, 0.945,
-             f"₹{lc:,.2f}  |  {N_BARS} bars per timeframe  "
-             f"|  ● MACD turns +ve   ● MACD turns -ve",
+             f"₹{lc:,.2f}  |  {N_BARS} bars per timeframe"
+             f"  |  ● MACD turns +ve   ● MACD turns -ve",
              color=s["subtext"], fontsize=8)
-    fig.text(0.97, 0.965,
-             f"Latest: {latest}",
+    fig.text(0.97, 0.965, f"Latest: {latest}",
              color=s["text"], fontsize=8, ha="right", fontweight="bold")
     fig.text(0.97, 0.945,
              f"EMA {EMA_PERIOD}  |  MACD ({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})"
              f"  |  Data: yfinance",
              color=s["subtext"], fontsize=7, ha="right")
 
-    # ── quarter dividers ──────────────────────────────────────────────────────
     fig.add_artist(plt.Line2D([0.02, 0.97], [0.50, 0.50],
                               transform=fig.transFigure,
                               color=s["border"], linewidth=1.5, alpha=0.8))
@@ -506,64 +845,139 @@ def plot_chart(symbol, d_df, w_df, m_df, h_df, output_path):
                               transform=fig.transFigure,
                               color=s["border"], linewidth=1.5, alpha=0.8))
 
-    plt.savefig(output_path, dpi=100,
-                facecolor=s["bg"], edgecolor="none")
+    plt.savefig(output_path, dpi=100, facecolor=s["bg"], edgecolor="none")
     plt.close(fig)
 
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  STEP 3 — BATCH CHART GENERATOR
+# ═══════════════════════════════════════════════════════════════
 
-def main():
+def generate_charts(filtered_df: pd.DataFrame):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print(f"\n{'='*62}")
-    print(f"  Multi-TF Chart Generator  –  NSE  |  White Theme")
-    print(f"  Quarters: Daily · Weekly · Monthly · Hourly  |  {N_BARS} bars each")
-    print(f"  Candles: Green/Red  |  MACD turns: ● green / ● red")
-    print(f"{'='*62}")
-
-    if not os.path.exists(EXCEL_FILE):
-        print(f"\n[ERROR] '{EXCEL_FILE}' not found.")
-        return
-
-    symbols = read_symbols(EXCEL_FILE, SYMBOL_COL)
-    print(f"\n  Loaded {len(symbols)} symbols from '{EXCEL_FILE}'")
-
     success, failed = [], []
+    total = len(filtered_df)
 
-    for i, sym in enumerate(symbols, 1):
+    for idx, row in enumerate(filtered_df.itertuples(), 1):
+        sym    = row.Symbol
         ticker = sym if sym.endswith(EXCHANGE_SFX) else sym + EXCHANGE_SFX
-        print(f"\n[{i:>3}/{len(symbols)}]  {ticker:<22}", end="", flush=True)
 
         try:
-            d_df  = fetch_ohlc(ticker, "1d")
-            w_df  = fetch_ohlc(ticker, "1wk")
-            m_df  = fetch_ohlc(ticker, "1mo")
-            h_df  = fetch_ohlc(ticker, "1h")
+            tv_cr = filtered_df.iloc[idx - 1]["Value (₹ Crores)"]
+        except Exception:
+            tv_cr = 0.0
+
+        print(f"\n[{idx:>4}/{total}]  {ticker:<22}  "
+              f"₹{tv_cr:>8,.1f} Cr", end="  ", flush=True)
+
+        try:
+            d_df = fetch_ohlc(ticker, "1d")
+            w_df = fetch_ohlc(ticker, "1wk")
+            m_df = fetch_ohlc(ticker, "1mo")
+            h_df = fetch_ohlc(ticker, "1h")
 
             counts = (f"D:{len(d_df) if d_df is not None else 0}"
                       f"  W:{len(w_df) if w_df is not None else 0}"
                       f"  M:{len(m_df) if m_df is not None else 0}"
                       f"  H:{len(h_df) if h_df is not None else 0}")
-            print(f"  {counts}", end="", flush=True)
+            print(counts, end="  ", flush=True)
 
             out = os.path.join(OUTPUT_DIR, f"{sym}.png")
             plot_chart(sym, d_df, w_df, m_df, h_df, out)
-            print(f"  →  {out}")
+            print(f"→  {out}")
             success.append(sym)
 
         except Exception:
-            print(f"  ✗  Error")
+            print("✗  Error")
             traceback.print_exc()
             failed.append(sym)
 
-    print(f"\n{'='*62}")
-    print(f"  Done!  {len(success)} charts saved to '{OUTPUT_DIR}/'")
+    return success, failed
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="NSE Live → Filter → 4-Timeframe Charts"
+    )
+    parser.add_argument("--visible",   action="store_true",
+                        help="Run Chrome with a visible window (local debug)")
+    parser.add_argument("--from-csv",  metavar="FILE",
+                        help="Skip browser — parse a manually downloaded NSE CSV")
+    parser.add_argument("--min-value", type=float, default=TRADED_VALUE_MIN_CR,
+                        help=f"Min traded value in ₹ Cr (default: {TRADED_VALUE_MIN_CR})")
+    args     = parser.parse_args()
+    headless = not args.visible
+
+    run_time = datetime.datetime.now().strftime("%d %b %Y  %H:%M:%S")
+    print(f"\n{'═'*65}")
+    print(f"  4-TF Chart Generator  —  NSE Live  |  {run_time}")
+    print(f"  Step 1 : Download NSE Stocks Traded (live)")
+    print(f"  Step 2 : Filter  EQ series, Value > ₹{args.min_value} Cr")
+    print(f"  Step 3 : 4-TF charts (Daily/Weekly/Monthly/Hourly)  →  {OUTPUT_DIR}/")
+    print(f"{'═'*65}")
+
+    # ── STEP 1 ───────────────────────────────────────────────
+    print(f"\n{'─'*65}")
+    print("  STEP 1  —  NSE live data download")
+    print(f"{'─'*65}")
+    all_df = download_nse_data(
+        headless=headless,
+        from_csv=getattr(args, "from_csv", None),
+    )
+    print(f"\n  Total records : {len(all_df)}")
+    all_df.to_csv("nse_all_stocks.csv", index=False)
+    print(f"  Saved         : nse_all_stocks.csv")
+
+    # ── STEP 2 ───────────────────────────────────────────────
+    print(f"\n{'─'*65}")
+    print(f"  STEP 2  —  Filter: Value > ₹{args.min_value} Cr  (EQ only)")
+    print(f"{'─'*65}")
+    filtered = filter_stocks(all_df, args.min_value)
+    print(f"\n  Stocks passing filter : {len(filtered)}")
+
+    if filtered.empty:
+        print("\n  ⚠  No stocks passed the filter.")
+        print("     Inspect nse_all_stocks.csv — check 'Value (₹ Crores)'.")
+        sys.exit(0)
+
+    print(f"\n  {'#':>4}  {'Symbol':<12} {'Company':<28} "
+          f"{'LTP':>8}  {'Value (Cr)':>11}  {'%Chg':>7}")
+    print(f"  {'─'*78}")
+    for i, row in filtered.head(25).iterrows():
+        print(f"  {i+1:>4}  {row['Symbol']:<12} "
+              f"{str(row.get('Company',''))[:26]:<28} "
+              f"  ₹{row['LTP (₹)']:>7,.2f}"
+              f"  ₹{row['Value (₹ Crores)']:>9,.1f} Cr"
+              f"  {row['% Change']:>+7.2f}%")
+    if len(filtered) > 25:
+        print(f"  … and {len(filtered) - 25} more stocks")
+
+    filtered.to_csv("nse_filtered_stocks.csv", index=False)
+    print(f"\n  Saved : nse_filtered_stocks.csv  ({len(filtered)} stocks)")
+
+    # ── STEP 3 ───────────────────────────────────────────────
+    print(f"\n{'─'*65}")
+    print(f"  STEP 3  —  Generating 4-TF charts  →  {OUTPUT_DIR}/")
+    print(f"  {N_BARS} bars per timeframe  |  White bg  |  Green/Red candles")
+    print(f"{'─'*65}")
+    success, failed = generate_charts(filtered)
+
+    print(f"\n{'═'*65}")
+    print(f"  DONE  —  {run_time}")
+    print(f"  NSE records  : {len(all_df)}")
+    print(f"  Filtered     : {len(filtered)}  (Value > ₹{args.min_value} Cr)")
+    print(f"  Charts saved : {len(success)}  →  {OUTPUT_DIR}/")
     if failed:
-        print(f"  Failed ({len(failed)}): {', '.join(failed[:20])}"
+        print(f"  Failed       : {len(failed)}: "
+              + ", ".join(failed[:20])
               + (" …" if len(failed) > 20 else ""))
-    print(f"{'='*62}\n")
+    print(f"  nse_all_stocks.csv      — full NSE list")
+    print(f"  nse_filtered_stocks.csv — filtered list")
+    print(f"{'═'*65}\n")
 
 
 if __name__ == "__main__":
