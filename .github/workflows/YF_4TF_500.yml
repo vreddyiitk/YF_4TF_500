@@ -30,7 +30,7 @@ jobs:
         run: pip install yfinance pandas openpyxl matplotlib selenium webdriver-manager
 
       - name: Run chart generator
-        run: python YTF_4TF_500_Final.py
+        run: python YF_4TF_500_Final.py
 
       - name: Check charts output
         run: |
